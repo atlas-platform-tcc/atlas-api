@@ -1,0 +1,10 @@
+# Go
+/bin/
+*.exe
+*.test
+*.out
+# deps vendored (opcional)
+/vendor/
+# secrets and local state
+.env
+atlas.db
