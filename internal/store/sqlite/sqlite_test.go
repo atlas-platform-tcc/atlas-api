@@ -68,6 +68,27 @@ func TestGetNotFound(t *testing.T) {
 	}
 }
 
+func TestDelete(t *testing.T) {
+	st := newStore(t)
+	ctx := context.Background()
+	if err := st.Create(ctx, sample()); err != nil {
+		t.Fatalf("create: %v", err)
+	}
+	if err := st.Delete(ctx, "payments"); err != nil {
+		t.Fatalf("delete: %v", err)
+	}
+	if _, err := st.Get(ctx, "payments"); err != store.ErrNotFound {
+		t.Fatalf("get after delete: err = %v, want ErrNotFound", err)
+	}
+	// deleting again is a not-found, and the name is free to be recreated
+	if err := st.Delete(ctx, "payments"); err != store.ErrNotFound {
+		t.Fatalf("delete missing: err = %v, want ErrNotFound", err)
+	}
+	if err := st.Create(ctx, sample()); err != nil {
+		t.Fatalf("recreate after delete: %v", err)
+	}
+}
+
 func TestMigrateFromOldSchema(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "old.db")
 

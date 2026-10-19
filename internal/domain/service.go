@@ -15,9 +15,12 @@ const (
 	DefaultReplicas   = 1
 	MaxNameLen        = 63
 
-	StatusRegistered  = "registered"
-	StatusRepoCreated = "repo_created"
-	StatusProvisioned = "provisioned"
+	StatusRegistered     = "registered"
+	StatusProvisioning   = "provisioning" // async provisioning in flight (ADR atlas-api/0018)
+	StatusRepoCreated    = "repo_created"
+	StatusProvisioned    = "provisioned"
+	StatusBlocked        = "blocked" // refused by the conformance gate (ADR atlas-api/0016)
+	StatusDeprovisioning = "deprovisioning"
 )
 
 // dns1123Label matches a valid Kubernetes/DNS-1123 label.
@@ -30,6 +33,36 @@ var envName = regexp.MustCompile(`^[A-Za-z_][A-Za-z0-9_]*$`)
 type EnvVar struct {
 	Name  string `json:"name"`
 	Value string `json:"value"`
+}
+
+// ConformanceResult is the outcome of a single policy rule (ADR atlas-api/0013).
+// Unverified marks a rule that applied but whose fact could not be gathered: best-effort
+// in audit mode, a failure in enforce mode (ADR atlas-api/0016).
+type ConformanceResult struct {
+	ID          string `json:"id"`
+	Description string `json:"description"`
+	Severity    string `json:"severity"` // high | medium | low
+	Pass        bool   `json:"pass"`
+	Unverified  bool   `json:"unverified,omitempty"`
+}
+
+// CommitStatus is a commit status published by the CI. The API reads it to verify
+// day-2 facts instead of trusting values self-reported by the deploy pipeline
+// (ADR atlas-api/0019).
+type CommitStatus struct {
+	State       string // success | failure | pending | error
+	Description string
+}
+
+// ConformanceReport is the evaluation of the platform policy against a service.
+// Score/Max are weighted by severity; Percent is the normalized 0..100 result.
+type ConformanceReport struct {
+	Score   int                 `json:"score"`
+	Max     int                 `json:"max"`
+	Percent int                 `json:"percent"`
+	Passed  int                 `json:"passed"`
+	Failed  int                 `json:"failed"`
+	Results []ConformanceResult `json:"results"`
 }
 
 // Database describes an optional database dependency for a service.
@@ -49,7 +82,84 @@ type Service struct {
 	RepoURL     string   `json:"repoUrl,omitempty"`
 	InfraPRURL  string   `json:"infraPrUrl,omitempty"`
 	GitopsPRURL string   `json:"gitopsPrUrl,omitempty"`
+	URL         string   `json:"url,omitempty"` // service URL once the GitOps PR is merged
 	CreatedAt   string   `json:"createdAt,omitempty"`
+
+	// Read from Argo CD at request time and never persisted: the catalog stays a
+	// projection of the desired (git) state (ADR atlas-api/0012).
+	Sync   string `json:"sync,omitempty"`
+	Health string `json:"health,omitempty"`
+
+	// Golden-path metrics emitted at provisioning (ADRs atlas-api/0013, 0014).
+	Conformance *ConformanceReport `json:"conformance,omitempty"`
+	ProvisionMs int64              `json:"provisionMs,omitempty"`
+}
+
+// SameSpec reports whether two services carry the same intent, ignoring projected
+// state. It is the idempotency key: re-posting an identical spec is a safe replay.
+func (s Service) SameSpec(o Service) bool {
+	if s.Name != o.Name || s.Language != o.Language || s.Replicas != o.Replicas ||
+		s.Database != o.Database || len(s.Env) != len(o.Env) {
+		return false
+	}
+	for i := range s.Env {
+		if s.Env[i] != o.Env[i] {
+			return false
+		}
+	}
+	return true
+}
+
+// Event is an append-only audit record of a lifecycle operation (ADR atlas-api/0017).
+// It outlives the service it refers to, capturing what the Git history cannot (e.g. a
+// gate-blocked provisioning that opened no Pull Request).
+type Event struct {
+	ID      int64  `json:"id"`
+	Service string `json:"service"`
+	Type    string `json:"type"`
+	Outcome string `json:"outcome"`         // ok | error | blocked
+	Actor   string `json:"actor,omitempty"` // X-Atlas-Actor header; "api" by default
+	Detail  string `json:"detail,omitempty"`
+	At      string `json:"at"` // RFC3339
+}
+
+// Event types recorded by the API.
+const (
+	EventRegistered      = "service.registered"
+	EventConformance     = "conformance.evaluated"
+	EventProvisioned     = "provision.succeeded"
+	EventGateBlocked     = "gate.blocked"
+	EventProvisionFailed = "provision.failed"
+	EventReplayed        = "create.replayed"
+	EventConflict        = "create.conflict"
+	EventDeprovisioned   = "deprovision.succeeded"
+	EventDeprovisionFail = "deprovision.failed"
+
+	// Ingested from the day-2 pipeline: the deploy runs in CI, not through the API.
+	EventDeployPromoted = "deploy.promoted"
+	EventDeployRollback = "deploy.rolled_back"
+
+	// Ingested from the Terraform runner after apply.
+	EventInfraApplied   = "infra.applied"
+	EventInfraDestroyed = "infra.destroyed"
+
+	// Derived by the observer poller on a status transition.
+	EventArgoHealthy     = "argocd.healthy"
+	EventArgoProgressing = "argocd.progressing"
+	EventArgoDegraded    = "argocd.degraded"
+
+	// Transparency (ADR atlas-api/0016): an unverifiable fact is recorded, not silent.
+	EventConformanceSkipped     = "conformance.skipped"
+	EventConformanceUnreachable = "conformance.unreachable"
+)
+
+// IngestableEventTypes are the event types an external actor may POST to the API;
+// every other type is recorded by the API itself.
+var IngestableEventTypes = map[string]bool{
+	EventDeployPromoted: true,
+	EventDeployRollback: true,
+	EventInfraApplied:   true,
+	EventInfraDestroyed: true,
 }
 
 // CreateServiceRequest is the JSON contract received by the API. Replicas and
@@ -74,7 +184,6 @@ type FieldError struct {
 func (r CreateServiceRequest) Validate() (Service, []FieldError) {
 	var errs []FieldError
 
-	// name
 	switch {
 	case r.Name == "":
 		errs = append(errs, FieldError{"name", "is required"})
@@ -84,7 +193,6 @@ func (r CreateServiceRequest) Validate() (Service, []FieldError) {
 		errs = append(errs, FieldError{"name", "must be a valid DNS-1123 label (lowercase alphanumeric and '-')"})
 	}
 
-	// language (guardrail)
 	switch {
 	case r.Language == "":
 		errs = append(errs, FieldError{"language", "is required"})
@@ -92,7 +200,6 @@ func (r CreateServiceRequest) Validate() (Service, []FieldError) {
 		errs = append(errs, FieldError{"language", `must be "` + SupportedLanguage + `"`})
 	}
 
-	// replicas (optional, default DefaultReplicas)
 	replicas := DefaultReplicas
 	if r.Replicas != nil {
 		replicas = *r.Replicas
@@ -101,7 +208,6 @@ func (r CreateServiceRequest) Validate() (Service, []FieldError) {
 		}
 	}
 
-	// database (optional; when enabled, type is required and must be supported)
 	var db Database
 	if r.Database != nil {
 		db.Enabled = r.Database.Enabled
@@ -117,7 +223,6 @@ func (r CreateServiceRequest) Validate() (Service, []FieldError) {
 		}
 	}
 
-	// env (optional): each entry needs a valid name; names must be unique.
 	seen := make(map[string]bool, len(r.Env))
 	for i, e := range r.Env {
 		field := fmt.Sprintf("env[%d].name", i)

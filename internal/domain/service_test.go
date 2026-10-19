@@ -101,3 +101,27 @@ func TestValidate_Invalid(t *testing.T) {
 		})
 	}
 }
+
+func TestSameSpec(t *testing.T) {
+	base := Service{Name: "payments", Language: "go", Replicas: 2,
+		Database: Database{Enabled: true, Type: "postgres"},
+		Env:      []EnvVar{{Name: "LOG_LEVEL", Value: "info"}}}
+
+	same := base
+	same.Status = StatusProvisioned // projected state must be ignored
+	same.RepoURL = "https://example/x"
+	if !base.SameSpec(same) {
+		t.Error("same intent with different projected state should be equal")
+	}
+
+	diff := base
+	diff.Replicas = 5
+	if base.SameSpec(diff) {
+		t.Error("different replicas should not be equal")
+	}
+	diffEnv := base
+	diffEnv.Env = []EnvVar{{Name: "LOG_LEVEL", Value: "debug"}}
+	if base.SameSpec(diffEnv) {
+		t.Error("different env value should not be equal")
+	}
+}

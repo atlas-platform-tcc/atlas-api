@@ -1,0 +1,126 @@
+# Política de conformidade da plataforma (policy-as-code) — ADR atlas-api/0013.
+# Cada regra assere um "fato" extraído dos artefatos; o score ponderado por severidade
+# alimenta o catálogo e o plano de impacto do PR. `when` restringe a aplicabilidade.
+#
+# As regras de CREATE avaliam os artefatos que a API gera em memória, antes dos PRs: são
+# especificação executável do padrão e teste de regressão do gerador, não guarda de
+# runtime contra edição posterior do atlas-gitops/atlas-infra (exigiria admission control
+# no cluster — trabalho futuro). Reprovam de fato as regras sobre o input do pedido
+# (réplicas, env, banco) e as de day-2 verificadas por procedência.
+#
+# ops: nonempty | truthy | equals | gte | lte | contains
+#
+# Gate (ADR atlas-api/0016): recusa se o score ficar abaixo de minScore ou se alguma
+# regra `required` avaliada falhar.
+minScore: 80
+# audit (default) pula o fato que não pôde ser verificado; enforce reprova (fail-closed).
+# Trocável por ATLAS_POLICY_MODE.
+mode: audit
+
+rules:
+  - id: base-chart
+    description: "Usa o chart base homologado (probes, requests/limits, labels e não-root por construção)"
+    severity: high
+    required: true
+    assert: { fact: chart.base, op: truthy }
+
+  - id: image-pinned
+    description: "Imagem fixada por SHA/digest imutável (não :latest nem tag mutável)"
+    severity: high
+    required: true
+    phases: [create, deploy]   # também vale na promoção day-2 (ADR atlas-api/0019)
+    assert: { fact: image.pinned, op: truthy }
+
+  - id: pipeline-present
+    description: "Pipeline de CI/CD gerado (build imutável + job Deploy day-2)"
+    severity: high
+    required: true
+    assert: { fact: pipeline.present, op: truthy }
+
+  - id: replicas-in-bounds
+    description: "Réplicas dentro dos limites da plataforma (mínimo 1)"
+    severity: medium
+    phases: [create, deploy]
+    assert: { fact: replicas, op: gte, value: 1 }
+
+  - id: application-finalizer
+    description: "Application declara o finalizer de cascata (teardown limpo no deprovisionamento)"
+    severity: low
+    assert: { fact: application.finalizer, op: truthy }
+
+  - id: application-no-create-namespace
+    description: "Application não cria o namespace (owned pelo atlas-infra; ordem de merge indiferente)"
+    severity: low
+    assert: { fact: application.createNamespace, op: equals, value: false }
+
+  - id: database-wired-when-requested
+    description: "Ligação de banco habilitada nos values quando o serviço solicita banco"
+    severity: high
+    required: true
+    when:   { fact: database.requested, op: truthy }
+    assert: { fact: database.wired, op: truthy }
+
+  # --- Governança/segurança sobre input variável (as que realmente reprovam) ---
+
+  - id: no-secret-env
+    description: "Nenhuma variável de ambiente com valor que aparente ser segredo (sem segredo no Git)"
+    severity: high
+    required: true
+    assert: { fact: env.hasSecretLike, op: equals, value: false }
+
+  - id: approved-registry
+    description: "Imagem publicada no registro aprovado da organização (ghcr.io/<org>/…)"
+    severity: high
+    required: true
+    phases: [create, deploy]
+    assert: { fact: image.approvedRegistry, op: truthy }
+
+  - id: template-readme
+    description: "Template do serviço traz README (todo golden path nasce documentado)"
+    severity: medium
+    assert: { fact: template.hasReadme, op: truthy }
+
+  - id: replicas-max
+    description: "Réplicas dentro do teto da plataforma (≤ 10)"
+    severity: medium
+    phases: [create, deploy]
+    assert: { fact: replicas, op: lte, value: 10 }
+
+  - id: resource-budget
+    description: "Pegada de CPU dentro do orçamento (réplicas × limit ≤ 2000m)"
+    severity: medium
+    phases: [create, deploy]
+    assert: { fact: resources.totalCpuMillis, op: lte, value: 2000 }
+
+  # --- Day-2: fatos VERIFICADOS pela API no GitHub (não auto-reportados) ---
+
+  # Lidos por procedência (status de commit publicados pelo CI e API do GitHub); ausência
+  # = "não verificado" (ADR atlas-api/0019). Cobertura e análise estática podem ser
+  # `required` porque o template já nasce com testes e código limpo: a plataforma só exige
+  # o que ela mesma entrega, e o gate só barra quando o desenvolvedor desvia do padrão.
+  - id: security-scan
+    description: "Scan de segurança da imagem sem vulnerabilidade crítica"
+    severity: high
+    required: true
+    phases: [deploy]
+    assert: { fact: scan.passed, op: truthy }
+
+  - id: static-analysis
+    description: "Análise estática (staticcheck) sem apontamentos no código do serviço"
+    severity: high
+    required: true
+    phases: [deploy]
+    assert: { fact: lint.passed, op: truthy }
+
+  - id: test-coverage
+    description: "Cobertura de testes mínima (≥ 60%)"
+    severity: medium
+    required: true
+    phases: [deploy]
+    assert: { fact: tests.coveragePct, op: gte, value: 60 }
+
+  - id: branch-protection
+    description: "Proteção de branch habilitada no repositório (main protegida)"
+    severity: medium
+    phases: [deploy]
+    assert: { fact: repo.branchProtected, op: truthy }

@@ -10,13 +10,14 @@ import (
 	"io"
 	"net/http"
 
+	"github.com/atlas-platform-tcc/atlas-api/internal/domain"
 	"github.com/atlas-platform-tcc/atlas-api/internal/generator"
 )
 
 const apiBase = "https://api.github.com"
 
-// GitHub creates repositories under an organization and pushes an initial commit
-// using the Git Data API (blobs -> tree -> commit -> ref). No git binary needed.
+// GitHub creates repositories under an organization and pushes commits using the
+// Git Data API (blobs -> tree -> commit -> ref). No git binary needed.
 type GitHub struct {
 	Org     string
 	Token   string
@@ -31,48 +32,69 @@ func (g *GitHub) client() *http.Client {
 	return http.DefaultClient
 }
 
+type treeEntry struct {
+	Path string `json:"path"`
+	Mode string `json:"mode"`
+	Type string `json:"type"`
+	SHA  string `json:"sha"`
+}
+
 // CreateRepo creates the repository and pushes files as a single commit on main.
 // It returns the repository's web URL and the initial commit SHA (used to pin the
 // base image built from that commit).
 func (g *GitHub) CreateRepo(ctx context.Context, name string, files generator.Files) (repoURL, commitSHA string, err error) {
-	var repo struct {
-		HTMLURL       string `json:"html_url"`
-		FullName      string `json:"full_name"`
-		DefaultBranch string `json:"default_branch"`
-	}
-	// auto_init:true initializes the git backend (an empty repo rejects the Git Data API
-	// with "Git Repository is empty"). We then replace main with our initial commit.
-	if err := g.do(ctx, http.MethodPost, "/orgs/"+g.Org+"/repos", map[string]any{
-		"name":      name,
-		"private":   g.Private,
-		"auto_init": true,
-	}, &repo); err != nil {
-		return "", "", fmt.Errorf("create repo: %w", err)
-	}
 	owner := g.Org
 
-	// 1. blob per file
-	type treeEntry struct {
-		Path string `json:"path"`
-		Mode string `json:"mode"`
-		Type string `json:"type"`
-		SHA  string `json:"sha"`
+	var repo struct {
+		HTMLURL       string `json:"html_url"`
+		DefaultBranch string `json:"default_branch"`
+		Archived      bool   `json:"archived"`
 	}
-	var tree []treeEntry
-	for path, content := range files {
-		var blob struct {
-			SHA string `json:"sha"`
+	exists := false
+	switch status, data, err := g.doRaw(ctx, http.MethodGet, "/repos/"+owner+"/"+name, nil); {
+	case err != nil:
+		return "", "", err
+	case status == http.StatusOK:
+		exists = true
+		if err := json.Unmarshal(data, &repo); err != nil {
+			return "", "", fmt.Errorf("decode repo: %w", err)
 		}
-		if err := g.do(ctx, http.MethodPost, fmt.Sprintf("/repos/%s/%s/git/blobs", owner, name), map[string]any{
-			"content":  base64.StdEncoding.EncodeToString(content),
-			"encoding": "base64",
-		}, &blob); err != nil {
-			return "", "", fmt.Errorf("create blob %s: %w", path, err)
+		if !repo.Archived {
+			// Re-pushing would move the initial commit and change the pinned base
+			// image, so a replay reuses the repo and its SHA (ADR atlas-api/0009).
+			branch := repo.DefaultBranch
+			if branch == "" {
+				branch = "main"
+			}
+			sha, err := g.headSHA(ctx, owner, name, branch)
+			return repo.HTMLURL, sha, err
 		}
-		tree = append(tree, treeEntry{Path: path, Mode: "100644", Type: "blob", SHA: blob.SHA})
+		// Archived = previously deprovisioned (ADR atlas-api/0011); a recreate must be a
+		// fresh service, so un-archive and re-push below.
+		if err := g.setArchived(ctx, name, false); err != nil {
+			return "", "", err
+		}
+	case status != http.StatusNotFound:
+		return "", "", fmt.Errorf("get repo: %d: %s", status, string(data))
 	}
 
-	// 2. tree
+	if !exists {
+		// auto_init:true initializes the git backend (an empty repo rejects the Git Data
+		// API with "Git Repository is empty"); main is forced to our commit below.
+		if err := g.do(ctx, http.MethodPost, "/orgs/"+g.Org+"/repos", map[string]any{
+			"name":      name,
+			"private":   g.Private,
+			"auto_init": true,
+		}, &repo); err != nil {
+			return "", "", fmt.Errorf("create repo: %w", err)
+		}
+	}
+
+	tree, err := g.blobTree(ctx, owner, name, files)
+	if err != nil {
+		return "", "", err
+	}
+
 	var treeResp struct {
 		SHA string `json:"sha"`
 	}
@@ -82,7 +104,7 @@ func (g *GitHub) CreateRepo(ctx context.Context, name string, files generator.Fi
 		return "", "", fmt.Errorf("create tree: %w", err)
 	}
 
-	// 3. commit (parentless orphan = clean single initial commit)
+	// Parentless: a single clean initial commit.
 	var commit struct {
 		SHA string `json:"sha"`
 	}
@@ -94,11 +116,11 @@ func (g *GitHub) CreateRepo(ctx context.Context, name string, files generator.Fi
 		return "", "", fmt.Errorf("create commit: %w", err)
 	}
 
-	// 4. force main to our commit, replacing the auto-init commit
 	branch := repo.DefaultBranch
 	if branch == "" {
 		branch = "main"
 	}
+	// Replace the auto_init commit.
 	if err := g.do(ctx, http.MethodPatch, fmt.Sprintf("/repos/%s/%s/git/refs/heads/%s", owner, name, branch), map[string]any{
 		"sha":   commit.SHA,
 		"force": true,
@@ -109,40 +131,273 @@ func (g *GitHub) CreateRepo(ctx context.Context, name string, files generator.Fi
 	return repo.HTMLURL, commit.SHA, nil
 }
 
-// OpenPR creates a branch off base in repo, commits files on it and opens a Pull
-// Request into base. It returns the Pull Request URL. Existing files are preserved
-// (the new tree is based on base's tree).
+// OpenPR creates a branch off base, commits files on it and opens a Pull Request into
+// base, returning its URL. Existing files are preserved (the tree extends base's).
 func (g *GitHub) OpenPR(ctx context.Context, repo, branch string, files generator.Files, title, body, base string) (string, error) {
 	owner := g.Org
 
-	// 1. base ref -> base commit sha
+	baseSHA, baseTreeSHA, err := g.baseCommit(ctx, owner, repo, base)
+	if err != nil {
+		return "", err
+	}
+
+	tree, err := g.blobTree(ctx, owner, repo, files)
+	if err != nil {
+		return "", err
+	}
+	var treeResp struct {
+		SHA string `json:"sha"`
+	}
+	if err := g.do(ctx, http.MethodPost, fmt.Sprintf("/repos/%s/%s/git/trees", owner, repo), map[string]any{
+		"base_tree": baseTreeSHA, // keep the other files
+		"tree":      tree,
+	}, &treeResp); err != nil {
+		return "", fmt.Errorf("create tree: %w", err)
+	}
+
+	return g.commitBranchPR(ctx, owner, repo, branch, baseSHA, treeResp.SHA, title, body, base)
+}
+
+// OpenDeletePR opens a Pull Request removing the given paths. Only paths present on
+// base are removed; if none are, it is a no-op returning an empty URL and nil error,
+// which keeps deprovisioning idempotent.
+func (g *GitHub) OpenDeletePR(ctx context.Context, repo, branch string, paths []string, title, body, base string) (string, error) {
+	owner := g.Org
+
+	baseSHA, baseTreeSHA, err := g.baseCommit(ctx, owner, repo, base)
+	if err != nil {
+		return "", err
+	}
+
+	var baseTree struct {
+		Tree []struct {
+			Path string `json:"path"`
+		} `json:"tree"`
+	}
+	if err := g.do(ctx, http.MethodGet, fmt.Sprintf("/repos/%s/%s/git/trees/%s?recursive=1", owner, repo, baseTreeSHA), nil, &baseTree); err != nil {
+		return "", fmt.Errorf("get base tree: %w", err)
+	}
+	exists := make(map[string]bool, len(baseTree.Tree))
+	for _, e := range baseTree.Tree {
+		exists[e.Path] = true
+	}
+	var present []string
+	for _, p := range paths {
+		if exists[p] {
+			present = append(present, p)
+		}
+	}
+	if len(present) == 0 {
+		return "", nil
+	}
+
+	// sha:null deletes an entry from base_tree.
+	del := make([]map[string]any, 0, len(present))
+	for _, p := range present {
+		del = append(del, map[string]any{"path": p, "mode": "100644", "type": "blob", "sha": nil})
+	}
+	var treeResp struct {
+		SHA string `json:"sha"`
+	}
+	if err := g.do(ctx, http.MethodPost, fmt.Sprintf("/repos/%s/%s/git/trees", owner, repo), map[string]any{
+		"base_tree": baseTreeSHA,
+		"tree":      del,
+	}, &treeResp); err != nil {
+		return "", fmt.Errorf("create tree: %w", err)
+	}
+
+	return g.commitBranchPR(ctx, owner, repo, branch, baseSHA, treeResp.SHA, title, body, base)
+}
+
+// ArchiveRepo marks the repository read-only. Archiving is reversible and preserves
+// history, so it is preferred over deletion (ADR atlas-api/0011). GitHub rejects a
+// PATCH on an already-archived repo (403), so that case — and a missing repo — is a no-op.
+func (g *GitHub) ArchiveRepo(ctx context.Context, name string) error {
+	var repo struct {
+		Archived bool `json:"archived"`
+	}
+	switch status, data, err := g.doRaw(ctx, http.MethodGet, "/repos/"+g.Org+"/"+name, nil); {
+	case err != nil:
+		return err
+	case status == http.StatusNotFound:
+		return nil
+	case status == http.StatusOK:
+		if err := json.Unmarshal(data, &repo); err != nil {
+			return fmt.Errorf("decode repo: %w", err)
+		}
+		if repo.Archived {
+			return nil
+		}
+	default:
+		return fmt.Errorf("get repo: %d: %s", status, string(data))
+	}
+	return g.setArchived(ctx, name, true)
+}
+
+// DeleteRepo permanently deletes the repository — irreversible, for the force path of
+// deprovisioning only. A missing repo (404) is a no-op. Requires delete_repo scope.
+func (g *GitHub) DeleteRepo(ctx context.Context, name string) error {
+	switch status, data, err := g.doRaw(ctx, http.MethodDelete, fmt.Sprintf("/repos/%s/%s", g.Org, name), nil); {
+	case err != nil:
+		return fmt.Errorf("delete repo: %w", err)
+	case status == http.StatusNotFound:
+		return nil
+	case status < 200 || status >= 300:
+		return fmt.Errorf("delete repo %s: %d: %s", name, status, string(data))
+	}
+	return nil
+}
+
+// ProtectBranch requires a Pull Request to merge into the given branch (no direct
+// pushes, admins included), with zero mandatory approvals so a single maintainer is
+// never deadlocked on their own PR (ADR atlas-api/0019). Idempotent (PUT). Requires a
+// token with repository admin.
+func (g *GitHub) ProtectBranch(ctx context.Context, repo, branch string) error {
+	body := map[string]any{
+		"required_status_checks":        nil,
+		"enforce_admins":                true,
+		"required_pull_request_reviews": map[string]any{"required_approving_review_count": 0},
+		"restrictions":                  nil,
+	}
+	switch status, data, err := g.doRaw(ctx, http.MethodPut, fmt.Sprintf("/repos/%s/%s/branches/%s/protection", g.Org, repo, branch), body); {
+	case err != nil:
+		return err
+	case status < 200 || status >= 300:
+		return fmt.Errorf("protect branch %s/%s: %d: %s", repo, branch, status, string(data))
+	}
+	return nil
+}
+
+// BranchProtected reports whether the branch has protection enabled, verified by the
+// API rather than self-reported (ADR atlas-api/0019). A 404 means "not protected";
+// other non-2xx (e.g. 403 without admin) is an error.
+func (g *GitHub) BranchProtected(ctx context.Context, repo string) (bool, error) {
+	switch status, data, err := g.doRaw(ctx, http.MethodGet, fmt.Sprintf("/repos/%s/%s/branches/main/protection", g.Org, repo), nil); {
+	case err != nil:
+		return false, err
+	case status == http.StatusOK:
+		return true, nil
+	case status == http.StatusNotFound:
+		return false, nil
+	default:
+		return false, fmt.Errorf("branch protection %s: %d: %s", repo, status, string(data))
+	}
+}
+
+// CommitStatuses returns the commit statuses for a SHA, keyed by context, used to
+// verify CI-published day-2 facts (atlas/scan, atlas/lint, atlas/coverage).
+func (g *GitHub) CommitStatuses(ctx context.Context, repo, sha string) (map[string]domain.CommitStatus, error) {
+	status, data, err := g.doRaw(ctx, http.MethodGet, fmt.Sprintf("/repos/%s/%s/commits/%s/status", g.Org, repo, sha), nil)
+	if err != nil {
+		return nil, err
+	}
+	if status != http.StatusOK {
+		return nil, fmt.Errorf("commit status %s@%s: %d: %s", repo, sha, status, string(data))
+	}
+	var payload struct {
+		Statuses []struct {
+			State       string `json:"state"`
+			Context     string `json:"context"`
+			Description string `json:"description"`
+		} `json:"statuses"`
+	}
+	if err := json.Unmarshal(data, &payload); err != nil {
+		return nil, fmt.Errorf("decode commit status: %w", err)
+	}
+	out := make(map[string]domain.CommitStatus, len(payload.Statuses))
+	for _, s := range payload.Statuses {
+		out[s.Context] = domain.CommitStatus{State: s.State, Description: s.Description}
+	}
+	return out, nil
+}
+
+func (g *GitHub) setArchived(ctx context.Context, name string, archived bool) error {
+	if err := g.do(ctx, http.MethodPatch, fmt.Sprintf("/repos/%s/%s", g.Org, name), map[string]any{
+		"archived": archived,
+	}, nil); err != nil {
+		return fmt.Errorf("set archived=%t on %s: %w", archived, name, err)
+	}
+	return nil
+}
+
+// DeletePackage deletes the service's container package so an orphan cannot collide
+// with a future same-named service (ADR atlas-api/0011). A missing package (404) is a
+// no-op. Requires delete:packages scope.
+func (g *GitHub) DeletePackage(ctx context.Context, name string) error {
+	path := fmt.Sprintf("/orgs/%s/packages/container/%s", g.Org, name)
+	req, err := http.NewRequestWithContext(ctx, http.MethodDelete, apiBase+path, nil)
+	if err != nil {
+		return err
+	}
+	req.Header.Set("Accept", "application/vnd.github+json")
+	req.Header.Set("Authorization", "Bearer "+g.Token)
+
+	resp, err := g.client().Do(req)
+	if err != nil {
+		return fmt.Errorf("delete package: %w", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode == http.StatusNotFound {
+		return nil
+	}
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		data, _ := io.ReadAll(resp.Body)
+		return fmt.Errorf("delete package %s: %s: %s", name, resp.Status, string(data))
+	}
+	return nil
+}
+
+// baseCommit resolves base's head to its commit SHA and tree SHA.
+func (g *GitHub) baseCommit(ctx context.Context, owner, repo, base string) (commitSHA, treeSHA string, err error) {
 	var ref struct {
 		Object struct {
 			SHA string `json:"sha"`
 		} `json:"object"`
 	}
 	if err := g.do(ctx, http.MethodGet, fmt.Sprintf("/repos/%s/%s/git/ref/heads/%s", owner, repo, base), nil, &ref); err != nil {
-		return "", fmt.Errorf("get base ref: %w", err)
+		return "", "", fmt.Errorf("get base ref: %w", err)
 	}
-	baseSHA := ref.Object.SHA
-
-	// 2. base commit -> base tree sha
-	var baseCommit struct {
+	var commit struct {
 		Tree struct {
 			SHA string `json:"sha"`
 		} `json:"tree"`
 	}
-	if err := g.do(ctx, http.MethodGet, fmt.Sprintf("/repos/%s/%s/git/commits/%s", owner, repo, baseSHA), nil, &baseCommit); err != nil {
-		return "", fmt.Errorf("get base commit: %w", err)
+	if err := g.do(ctx, http.MethodGet, fmt.Sprintf("/repos/%s/%s/git/commits/%s", owner, repo, ref.Object.SHA), nil, &commit); err != nil {
+		return "", "", fmt.Errorf("get base commit: %w", err)
 	}
+	return ref.Object.SHA, commit.Tree.SHA, nil
+}
 
-	// 3. blobs + tree (based on the existing tree so other files are kept)
-	type treeEntry struct {
-		Path string `json:"path"`
-		Mode string `json:"mode"`
-		Type string `json:"type"`
-		SHA  string `json:"sha"`
+// headSHA returns the commit SHA at the tip of a branch.
+func (g *GitHub) headSHA(ctx context.Context, owner, repo, branch string) (string, error) {
+	var ref struct {
+		Object struct {
+			SHA string `json:"sha"`
+		} `json:"object"`
 	}
+	if err := g.do(ctx, http.MethodGet, fmt.Sprintf("/repos/%s/%s/git/ref/heads/%s", owner, repo, branch), nil, &ref); err != nil {
+		return "", fmt.Errorf("get head sha: %w", err)
+	}
+	return ref.Object.SHA, nil
+}
+
+// existingPR returns the URL of an open PR from branch into base, or "" if none.
+func (g *GitHub) existingPR(ctx context.Context, owner, repo, branch, base string) (string, error) {
+	var prs []struct {
+		HTMLURL string `json:"html_url"`
+	}
+	q := fmt.Sprintf("/repos/%s/%s/pulls?state=open&head=%s:%s&base=%s", owner, repo, owner, branch, base)
+	if err := g.do(ctx, http.MethodGet, q, nil, &prs); err != nil {
+		return "", err
+	}
+	if len(prs) > 0 {
+		return prs[0].HTMLURL, nil
+	}
+	return "", nil
+}
+
+// blobTree uploads each file as a blob and returns the tree entries.
+func (g *GitHub) blobTree(ctx context.Context, owner, repo string, files generator.Files) ([]treeEntry, error) {
 	var tree []treeEntry
 	for path, content := range files {
 		var blob struct {
@@ -152,67 +407,104 @@ func (g *GitHub) OpenPR(ctx context.Context, repo, branch string, files generato
 			"content":  base64.StdEncoding.EncodeToString(content),
 			"encoding": "base64",
 		}, &blob); err != nil {
-			return "", fmt.Errorf("create blob %s: %w", path, err)
+			return nil, fmt.Errorf("create blob %s: %w", path, err)
 		}
 		tree = append(tree, treeEntry{Path: path, Mode: "100644", Type: "blob", SHA: blob.SHA})
 	}
-	var treeResp struct {
-		SHA string `json:"sha"`
-	}
-	if err := g.do(ctx, http.MethodPost, fmt.Sprintf("/repos/%s/%s/git/trees", owner, repo), map[string]any{
-		"base_tree": baseCommit.Tree.SHA,
-		"tree":      tree,
-	}, &treeResp); err != nil {
-		return "", fmt.Errorf("create tree: %w", err)
-	}
+	return tree, nil
+}
 
-	// 4. commit on top of base
+// commitBranchPR commits treeSHA on the branch and opens a PR into base, returning its
+// URL. No merge is performed — human review is the gate. Re-running never duplicates:
+// the branch is force-updated and an open PR is reused (ADR atlas-api/0009).
+func (g *GitHub) commitBranchPR(ctx context.Context, owner, repo, branch, baseSHA, treeSHA, title, body, base string) (string, error) {
 	var commit struct {
 		SHA string `json:"sha"`
 	}
 	if err := g.do(ctx, http.MethodPost, fmt.Sprintf("/repos/%s/%s/git/commits", owner, repo), map[string]any{
 		"message": title,
-		"tree":    treeResp.SHA,
+		"tree":    treeSHA,
 		"parents": []string{baseSHA},
 	}, &commit); err != nil {
 		return "", fmt.Errorf("create commit: %w", err)
 	}
 
-	// 5. create the branch ref
-	if err := g.do(ctx, http.MethodPost, fmt.Sprintf("/repos/%s/%s/git/refs", owner, repo), map[string]any{
+	switch status, data, err := g.doRaw(ctx, http.MethodPost, fmt.Sprintf("/repos/%s/%s/git/refs", owner, repo), map[string]any{
 		"ref": "refs/heads/" + branch,
 		"sha": commit.SHA,
-	}, nil); err != nil {
-		return "", fmt.Errorf("create branch: %w", err)
+	}); {
+	case err != nil:
+		return "", err
+	case status == http.StatusUnprocessableEntity:
+		if err := g.do(ctx, http.MethodPatch, fmt.Sprintf("/repos/%s/%s/git/refs/heads/%s", owner, repo, branch), map[string]any{
+			"sha":   commit.SHA,
+			"force": true,
+		}, nil); err != nil {
+			return "", fmt.Errorf("update branch: %w", err)
+		}
+	case status < 200 || status >= 300:
+		return "", fmt.Errorf("create branch: %d: %s", status, string(data))
 	}
 
-	// 6. open the PR (no merge — human review is the gate)
+	if url, err := g.existingPR(ctx, owner, repo, branch, base); err != nil {
+		return "", err
+	} else if url != "" {
+		return url, nil
+	}
+
 	var pr struct {
 		HTMLURL string `json:"html_url"`
 	}
-	if err := g.do(ctx, http.MethodPost, fmt.Sprintf("/repos/%s/%s/pulls", owner, repo), map[string]any{
+	switch status, data, err := g.doRaw(ctx, http.MethodPost, fmt.Sprintf("/repos/%s/%s/pulls", owner, repo), map[string]any{
 		"title": title,
 		"head":  branch,
 		"base":  base,
 		"body":  body,
-	}, &pr); err != nil {
-		return "", fmt.Errorf("open pull request: %w", err)
+	}); {
+	case err != nil:
+		return "", err
+	case status == http.StatusUnprocessableEntity: // PR already exists — look it up
+		return g.existingPR(ctx, owner, repo, branch, base)
+	case status < 200 || status >= 300:
+		return "", fmt.Errorf("open pull request: %d: %s", status, string(data))
+	default:
+		if err := json.Unmarshal(data, &pr); err != nil {
+			return "", fmt.Errorf("decode pull request: %w", err)
+		}
 	}
 	return pr.HTMLURL, nil
 }
 
 func (g *GitHub) do(ctx context.Context, method, path string, body, out any) error {
+	status, data, err := g.doRaw(ctx, method, path, body)
+	if err != nil {
+		return err
+	}
+	if status < 200 || status >= 300 {
+		return fmt.Errorf("github %s %s: %d: %s", method, path, status, string(data))
+	}
+	if out != nil {
+		if err := json.Unmarshal(data, out); err != nil {
+			return fmt.Errorf("decode response: %w", err)
+		}
+	}
+	return nil
+}
+
+// doRaw returns the status code and body without treating non-2xx as an error, so
+// callers can branch on specific codes (404, 422) for idempotency.
+func (g *GitHub) doRaw(ctx context.Context, method, path string, body any) (int, []byte, error) {
 	var buf io.Reader
 	if body != nil {
 		b, err := json.Marshal(body)
 		if err != nil {
-			return err
+			return 0, nil, err
 		}
 		buf = bytes.NewReader(b)
 	}
 	req, err := http.NewRequestWithContext(ctx, method, apiBase+path, buf)
 	if err != nil {
-		return err
+		return 0, nil, err
 	}
 	req.Header.Set("Accept", "application/vnd.github+json")
 	req.Header.Set("Authorization", "Bearer "+g.Token)
@@ -222,17 +514,9 @@ func (g *GitHub) do(ctx context.Context, method, path string, body, out any) err
 
 	resp, err := g.client().Do(req)
 	if err != nil {
-		return err
+		return 0, nil, err
 	}
 	defer resp.Body.Close()
 	data, _ := io.ReadAll(resp.Body)
-	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		return fmt.Errorf("github %s %s: %s: %s", method, path, resp.Status, string(data))
-	}
-	if out != nil {
-		if err := json.Unmarshal(data, out); err != nil {
-			return fmt.Errorf("decode response: %w", err)
-		}
-	}
-	return nil
+	return resp.StatusCode, data, nil
 }

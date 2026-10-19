@@ -24,17 +24,45 @@ type Store interface {
 	Update(ctx context.Context, s domain.Service) error
 	Get(ctx context.Context, name string) (domain.Service, error)
 	List(ctx context.Context) ([]domain.Service, error)
+	Delete(ctx context.Context, name string) error
+
+	// AppendEvent records an audit event. Events are never mutated or deleted and they
+	// outlive the service they refer to (ADR atlas-api/0017).
+	AppendEvent(ctx context.Context, e domain.Event) error
+	// ListEvents returns events most-recent-first; an empty service returns the whole feed.
+	ListEvents(ctx context.Context, service string, limit int) ([]domain.Event, error)
 }
 
 // Memory is an in-memory Store, useful for tests and local runs without a DB.
 type Memory struct {
-	mu   sync.RWMutex
-	data map[string]domain.Service
+	mu     sync.RWMutex
+	data   map[string]domain.Service
+	events []domain.Event
 }
 
 // NewMemory returns an empty in-memory catalog.
 func NewMemory() *Memory {
 	return &Memory{data: make(map[string]domain.Service)}
+}
+
+func (m *Memory) AppendEvent(_ context.Context, e domain.Event) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	e.ID = int64(len(m.events) + 1)
+	m.events = append(m.events, e)
+	return nil
+}
+
+func (m *Memory) ListEvents(_ context.Context, service string, limit int) ([]domain.Event, error) {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	out := make([]domain.Event, 0, limit)
+	for i := len(m.events) - 1; i >= 0 && len(out) < limit; i-- {
+		if service == "" || m.events[i].Service == service {
+			out = append(out, m.events[i])
+		}
+	}
+	return out, nil
 }
 
 func (m *Memory) Create(_ context.Context, s domain.Service) error {
@@ -54,6 +82,16 @@ func (m *Memory) Update(_ context.Context, s domain.Service) error {
 		return ErrNotFound
 	}
 	m.data[s.Name] = s
+	return nil
+}
+
+func (m *Memory) Delete(_ context.Context, name string) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if _, ok := m.data[name]; !ok {
+		return ErrNotFound
+	}
+	delete(m.data, name)
 	return nil
 }
 

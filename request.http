@@ -1,0 +1,76 @@
+### atlas-api — requisições de teste (VS Code REST Client / JetBrains HTTP Client)
+### Ajuste @port conforme a env PORT da API (default do main.go: 8081).
+
+@port = 8081
+@baseUrl = http://localhost:{{port}}
+@name = payments
+@dbName = orders
+
+### Health
+GET {{baseUrl}}/healthz
+
+### Listar catálogo
+GET {{baseUrl}}/services
+
+### Obter um serviço (anexa sync/health se ARGOCD_* estiver configurado)
+GET {{baseUrl}}/services/{{name}}
+
+### Criar serviço (sem banco) — espera 201; replay idêntico depois → 200
+POST {{baseUrl}}/services
+Content-Type: application/json
+
+{
+  "name": "{{name}}",
+  "language": "go",
+  "replicas": 2
+}
+
+### Criar serviço (com banco) — habilita a ligação Postgres no chart
+POST {{baseUrl}}/services
+Content-Type: application/json
+
+{
+  "name": "{{dbName}}",
+  "language": "go",
+  "replicas": 2,
+  "database": { "enabled": true, "type": "postgres" },
+  "env": [
+    { "name": "LOG_LEVEL", "value": "info" }
+  ]
+}
+
+### Replay idempotente — mesmo spec de {{name}} → espera HTTP 200 (no-op, não reprovisiona)
+POST {{baseUrl}}/services
+Content-Type: application/json
+
+{
+  "name": "{{name}}",
+  "language": "go",
+  "replicas": 2
+}
+
+### Conflito — mesmo nome, spec diferente → espera HTTP 409
+POST {{baseUrl}}/services
+Content-Type: application/json
+
+{
+  "name": "{{name}}",
+  "language": "go",
+  "replicas": 5
+}
+
+### Validação — payload inválido → espera HTTP 422 com fields[]
+POST {{baseUrl}}/services
+Content-Type: application/json
+
+{
+  "name": "Invalid_Name",
+  "language": "rust",
+  "replicas": 99
+}
+
+### Deletar (arquiva o repo — reversível) → 202 com os teardown PRs
+DELETE {{baseUrl}}/services/{{name}}
+
+### Deletar com force (deleta repo + pacote; para testes) → 202
+DELETE {{baseUrl}}/services/{{dbName}}?force=true
